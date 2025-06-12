@@ -1,0 +1,512 @@
+apiVersion: zeabur.com/v1
+kind: Template
+metadata:
+  name: RagFlow
+spec:
+  description: A comprehensive data processing and analysis stack including Elasticsearch, OpenSearch, MySQL, Redis, MinIO, and more.
+  coverImage: https://raw.githubusercontent.com/zeabur/zeabur/main/imgs/banner.png
+  icon: https://raw.githubusercontent.com/zeabur/zeabur/main/imgs/logo.png
+
+  tags:
+    - Database
+    - Analytics
+    - Search
+    - Cache
+    - Storage
+  readme: >-
+    # RagFlow Stack
+
+    RagFlow is a comprehensive data processing and analysis stack that includes:
+
+    - Elasticsearch: Powerful search and analytics engine
+    - OpenSearch: Search and analytics suite
+    - MySQL: Relational database
+    - Redis: In-memory data structure store
+    - MinIO: High-performance object storage
+    - Infinity: High-performance vector database
+
+    This template sets up all components with proper configuration and security settings.
+  resourceUsage:
+    cpu: 1.0
+    memory: 4096
+  services:
+
+    - name: elasticsearch
+      template: PREBUILT
+      spec:
+        source:
+          image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+          command:
+            - /bin/bash
+          args:
+            - -c
+            - |
+              groupadd -g 1000 elasticsearch || true
+              useradd -u 1000 -g 1000 -d /usr/share/elasticsearch elasticsearch || true
+              chown -R elasticsearch:elasticsearch /usr/share/elasticsearch
+              su elasticsearch -c "cd /usr/share/elasticsearch && ./bin/elasticsearch-keystore create"
+              su elasticsearch -c "cd /usr/share/elasticsearch && ./bin/elasticsearch"
+        env:
+          discovery.type:
+            default: single-node
+          xpack.security.enabled:
+            default: "false"
+          ES_JAVA_OPTS:
+            default: "-Xms512m -Xmx512m"
+        ports:
+          - id: elasticsearch
+            port: 9200
+            type: HTTP
+
+    - name: mysql
+      template: PREBUILT
+      spec:
+        source:
+          image: mysql:8.0.39
+          command:
+            - /bin/bash
+          args:
+            - -c
+            - |
+              docker-entrypoint.sh mysqld --default-authentication-plugin=mysql_native_password --bind-address=0.0.0.0 --sql-mode="" &
+              MYSQL_PID=$!
+              
+              # Wait for MySQL to start
+              until mysqladmin ping -h localhost --silent; do
+                echo 'Waiting for MySQL to start...'
+                sleep 2
+              done
+              
+              # Grant permissions for remote connections
+              mysql -u root -p0fPZE#u0fPZE#u -e "
+                CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED WITH mysql_native_password BY '0fPZE#u0fPZE#u';
+                GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
+                CREATE DATABASE IF NOT EXISTS rag_flow;
+                USE rag_flow;
+                FLUSH PRIVILEGES;
+              " || echo "User setup completed with possible warnings"
+              
+              wait $MYSQL_PID
+        env:
+          MYSQL_ROOT_PASSWORD:
+            default: 0fPZE#u0fPZE#u
+          MYSQL_DATABASE:
+            default: rag_flow
+          MYSQL_ROOT_HOST:
+            default: "%"
+          MYSQL_TCP_PORT: 
+            default: "3306"
+          TZ:
+            default: Asia/Taipei
+        ports:
+          - id: mysql
+            port: 3306
+            type: TCP
+
+
+    - name: redis
+      template: PREBUILT
+      spec:
+        source:
+          image: redis:7-alpine
+          command:
+            - redis-server
+          args:
+            - --bind
+            - 0.0.0.0
+            - --port
+            - "6379"
+            - --requirepass
+            - ragflowpass
+            - --maxmemory
+            - 128mb
+            - --maxmemory-policy
+            - allkeys-lru
+            - --save
+            - "900 1"
+            - --save
+            - "300 10"
+            - --save
+            - "60 10000"
+        ports:
+          - id: redis
+            port: 6379
+            type: TCP
+
+    - name: minio
+      template: PREBUILT
+      spec:
+        source:
+          image: quay.io/minio/minio:latest
+          command:
+            - /bin/sh
+          args:
+            - -c
+            - |
+              minio server /data --console-address :9001 &
+              MINIO_PID=$!
+              while ! curl -s http://localhost:9000/minio/health/live; do
+                echo 'Waiting for MinIO to start...'
+                sleep 1
+              done
+              sleep 5
+              mc alias set myminio http://localhost:9000 $MINIO_ROOT_USER $MINIO_ROOT_PASSWORD
+              echo "Creating bucket 'ragflow'"
+              mc mb myminio/ragflow
+              wait $MINIO_PID
+        volumes:
+          - id: minio-data
+            dir: /data
+        ports:
+          - id: minio
+            port: 9000
+            type: HTTP
+          - id: minioconsole
+            port: 9001
+            type: HTTP
+        env:
+          MINIO_ROOT_USER:
+            default: ragflow
+          MINIO_ROOT_PASSWORD:
+            default: 0fPZE#u0fPZE#u
+          MINIO_BROWSER_REDIRECT:
+            default: "false"
+
+
+    - name: ragflow
+      template: PREBUILT
+      spec:
+        source:
+          image: infiniflow/ragflow:v0.19.x-slim
+          command:
+            - /bin/bash
+          args:
+            - /ragflow/entrypoint.sh
+        ports:
+          - id: ragflowmain
+            port: 9380
+            type: HTTP
+          - id: ragflowhttp
+            port: 80
+            type: HTTP
+          - id: ragflowhttps
+            port: 443
+            type: HTTP
+          - id: ragflowdebug1
+            port: 5678
+            type: TCP
+          - id: ragflowdebug2
+            port: 5679
+            type: TCP
+          - id: ragflowmcp
+            port: 9382
+            type: HTTP
+        volumes:
+          - id: ragflow-logs
+            dir: /ragflow/logs
+          - id: history-data-agent
+            dir: /ragflow/history_data_agent
+        configs:
+          - path: /ragflow/entrypoint.sh
+            template: |
+              #!/usr/bin/env bash
+
+              set -e
+
+              # -----------------------------------------------------------------------------
+              # Usage and command-line argument parsing
+              # -----------------------------------------------------------------------------
+              function usage() {
+                  echo "Usage: $0 [--disable-webserver] [--disable-taskexecutor] [--consumer-no-beg=<num>] [--consumer-no-end=<num>] [--workers=<num>] [--host-id=<string>]"
+                  echo
+                  echo "  --disable-webserver             Disables the web server (nginx + ragflow_server)."
+                  echo "  --disable-taskexecutor          Disables task executor workers."
+                  echo "  --enable-mcpserver              Enables the MCP server."
+                  echo "  --consumer-no-beg=<num>         Start range for consumers (if using range-based)."
+                  echo "  --consumer-no-end=<num>         End range for consumers (if using range-based)."
+                  echo "  --workers=<num>                 Number of task executors to run (if range is not used)."
+                  echo "  --host-id=<string>              Unique ID for the host (defaults to \`hostname\`)."
+                  echo
+                  echo "Examples:"
+                  echo "  $0 --disable-taskexecutor"
+                  echo "  $0 --disable-webserver --consumer-no-beg=0 --consumer-no-end=5"
+                  echo "  $0 --disable-webserver --workers=2 --host-id=myhost123"
+                  echo "  $0 --enable-mcpserver"
+                  exit 1
+              }
+
+              ENABLE_WEBSERVER=1 # Default to enable web server
+              ENABLE_TASKEXECUTOR=1  # Default to enable task executor
+              ENABLE_MCP_SERVER=0
+              CONSUMER_NO_BEG=0
+              CONSUMER_NO_END=0
+              WORKERS=1
+
+              MCP_HOST="127.0.0.1"
+              MCP_PORT=9382
+              MCP_BASE_URL="http://127.0.0.1:9380"
+              MCP_SCRIPT_PATH="/ragflow/mcp/server/server.py"
+              MCP_MODE="self-host"
+              MCP_HOST_API_KEY=""
+
+              # -----------------------------------------------------------------------------
+              # Host ID logic:
+              #   1. By default, use the system hostname if length <= 32
+              #   2. Otherwise, use the full MD5 hash of the hostname (32 hex chars)
+              # -----------------------------------------------------------------------------
+              CURRENT_HOSTNAME="$(hostname)"
+              if [ ${#CURRENT_HOSTNAME} -le 32 ]; then
+                DEFAULT_HOST_ID="$CURRENT_HOSTNAME"
+              else
+                DEFAULT_HOST_ID="$(echo -n "$CURRENT_HOSTNAME" | md5sum | cut -d ' ' -f 1)"
+              fi
+
+              HOST_ID="$DEFAULT_HOST_ID"
+
+              # Parse arguments
+              for arg in "$@"; do
+                case $arg in
+                  --disable-webserver)
+                    ENABLE_WEBSERVER=0
+                    shift
+                    ;;
+                  --disable-taskexecutor)
+                    ENABLE_TASKEXECUTOR=0
+                    shift
+                    ;;
+                  --enable-mcpserver)
+                    ENABLE_MCP_SERVER=1
+                    shift
+                    ;;
+                  --mcp-host=*)
+                    MCP_HOST="${arg#*=}"
+                    shift
+                    ;;
+                  --mcp-port=*)
+                    MCP_PORT="${arg#*=}"
+                    shift
+                    ;;
+                  --mcp-base-url=*)
+                    MCP_BASE_URL="${arg#*=}"
+                    shift
+                    ;;
+                  --mcp-mode=*)
+                    MCP_MODE="${arg#*=}"
+                    shift
+                    ;;
+                  --mcp-host-api-key=*)
+                    MCP_HOST_API_KEY="${arg#*=}"
+                    shift
+                    ;;
+                  --mcp-script-path=*)
+                    MCP_SCRIPT_PATH="${arg#*=}"
+                    shift
+                    ;;
+                  --consumer-no-beg=*)
+                    CONSUMER_NO_BEG="${arg#*=}"
+                    shift
+                    ;;
+                  --consumer-no-end=*)
+                    CONSUMER_NO_END="${arg#*=}"
+                    shift
+                    ;;
+                  --workers=*)
+                    WORKERS="${arg#*=}"
+                    shift
+                    ;;
+                  --host-id=*)
+                    HOST_ID="${arg#*=}"
+                    shift
+                    ;;
+                  *)
+                    usage
+                    ;;
+                esac
+              done
+
+              # -----------------------------------------------------------------------------
+              # Replace env variables in the service_conf.yaml file
+              # -----------------------------------------------------------------------------
+              CONF_DIR="/ragflow/conf"
+              TEMPLATE_FILE="${CONF_DIR}/service_conf.yaml.template"
+              CONF_FILE="${CONF_DIR}/service_conf.yaml"
+
+              rm -f "${CONF_FILE}"
+              while IFS= read -r line || [[ -n "$line" ]]; do
+                  eval "echo \"$line\"" >> "${CONF_FILE}"
+              done < "${TEMPLATE_FILE}"
+
+              export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu/"
+              PY=python3
+
+              # -----------------------------------------------------------------------------
+              # Function(s)
+              # -----------------------------------------------------------------------------
+
+              function task_exe() {
+                  local consumer_id="$1"
+                  local host_id="$2"
+
+                  JEMALLOC_PATH="$(pkg-config --variable=libdir jemalloc)/libjemalloc.so"
+                  while true; do
+                      LD_PRELOAD="$JEMALLOC_PATH" \
+                      "$PY" rag/svr/task_executor.py "${host_id}_${consumer_id}"
+                  done
+              }
+
+              function start_mcp_server() {
+                  echo "Starting MCP Server on ${MCP_HOST}:${MCP_PORT} with base URL ${MCP_BASE_URL}..."
+                  "$PY" "${MCP_SCRIPT_PATH}" \
+                      --host="${MCP_HOST}" \
+                      --port="${MCP_PORT}" \
+                      --base_url="${MCP_BASE_URL}" \
+                      --mode="${MCP_MODE}" \
+                      --api_key="${MCP_HOST_API_KEY}" &
+              }
+
+              # -----------------------------------------------------------------------------
+              # Start components based on flags
+              # -----------------------------------------------------------------------------
+
+              if [[ "${ENABLE_WEBSERVER}" -eq 1 ]]; then
+                  echo "Starting nginx..."
+                  /usr/sbin/nginx
+
+                  echo "Starting ragflow_server..."
+                  while true; do
+                      "$PY" api/ragflow_server.py
+                  done &
+              fi
+
+
+              if [[ "${ENABLE_MCP_SERVER}" -eq 1 ]]; then
+                  start_mcp_server
+              fi
+
+              if [[ "${ENABLE_TASKEXECUTOR}" -eq 1 ]]; then
+                  if [[ "${CONSUMER_NO_END}" -gt "${CONSUMER_NO_BEG}" ]]; then
+                      echo "Starting task executors on host '${HOST_ID}' for IDs in [${CONSUMER_NO_BEG}, ${CONSUMER_NO_END})..."
+                      for (( i=CONSUMER_NO_BEG; i<CONSUMER_NO_END; i++ ))
+                      do
+                        task_exe "${i}" "${HOST_ID}" &
+                      done
+                  else
+                      # Otherwise, start a fixed number of workers
+                      echo "Starting ${WORKERS} task executor(s) on host '${HOST_ID}'..."
+                      for (( i=0; i<WORKERS; i++ ))
+                      do
+                        task_exe "${i}" "${HOST_ID}" &
+                      done
+                  fi
+              fi
+
+              wait
+          - path: /ragflow/conf/service_conf.yaml.template
+            template: |
+              ragflow:
+                host: 0.0.0.0
+                http_port: 9380
+              mysql:
+                name: 'rag_flow'
+                user: 'root'
+                password: '0fPZE#u0fPZE#u'
+                host: 'mysql.zeabur.internal'
+                port: 3306
+                max_connections: 900
+                stale_timeout: 300
+              minio:
+                user: 'ragflow'
+                password: '0fPZE#u0fPZE#u'
+                host: 'minio.zeabur.internal:9000'
+              es:
+                hosts: 'http://elasticsearch.zeabur.internal:9200'
+                username: ''
+                password: ''
+              redis:
+                db: 1
+                password: 'ragflowpass'
+                host: 'redis.zeabur.internal:6379'
+            envsubst: true
+          - path: /etc/nginx/conf.d/ragflow.conf
+            template: |
+              server {
+                  listen 80;
+                  server_name _;
+                  root /ragflow/web/dist;
+
+                  gzip on;
+                  gzip_min_length 1k;
+                  gzip_comp_level 9;
+                  gzip_types text/plain application/javascript application/x-javascript text/css application/xml text/javascript application/x-httpd-php image/jpeg image/gif image/png;
+                  gzip_vary on;
+                  gzip_disable "MSIE [1-6]\.";
+
+                  location ~ ^/(v1|api) {
+                      proxy_pass http://127.0.0.1:9380;
+                      include proxy.conf;
+                  }
+
+                  location / {
+                      index index.html;
+                      try_files $uri $uri/ /index.html;
+                  }
+
+                  # Cache-Control: max-age~@~AExpires
+                  location ~ ^/static/(css|js|media)/ {
+                      expires 10y;
+                      access_log off;
+                  }
+              }
+          - path: /etc/nginx/proxy.conf
+            template: |
+              proxy_set_header Host $host;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              proxy_http_version 1.1;
+              proxy_set_header Connection "";
+              proxy_buffering off;
+              proxy_read_timeout 3600s;
+              proxy_send_timeout 3600s;
+          - path: /etc/nginx/nginx.conf
+            template: |
+              user  root;
+              worker_processes  auto;
+
+              error_log  /var/log/nginx/error.log notice;
+              pid        /var/run/nginx.pid;
+
+              events {
+                  worker_connections  1024;
+              }
+
+              http {
+                  include       /etc/nginx/mime.types;
+                  default_type  application/octet-stream;
+
+                  log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                                    '$status $body_bytes_sent "$http_referer" '
+                                    '"$http_user_agent" "$http_x_forwarded_for"';
+
+                  access_log  /var/log/nginx/access.log  main;
+
+                  sendfile        on;
+                  keepalive_timeout  65;
+                  client_max_body_size 1024M;
+
+                  include /etc/nginx/conf.d/ragflow.conf;
+              }
+        env:
+          TZ:
+            default: Asia/Taipei
+         
+          MINIO_ACCESS_KEY:
+            default: ragflow
+          MINIO_SECRET_KEY:
+            default: 0fPZE#u0fPZE#u
+          HF_ENDPOINT:
+            default: https://huggingface.co
+          MACOS:
+            default: "false"
+
+
+
