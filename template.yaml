@@ -113,7 +113,7 @@ spec:
       template: PREBUILT
       spec:
         source:
-          image: redis:7-alpine
+          image: redis
           command:
             - redis-server
           args:
